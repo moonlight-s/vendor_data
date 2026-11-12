@@ -1,0 +1,36 @@
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# ============ 运行产物（可再生成、体积大）============
+# schema/ 是处理规则的一部分，要进 git；下面这些不进
+*/reports/
+*/logs/
+*.log
+*.jsonl
+
+# ============ 数据文件（原始数据和中间数据都不进 git）============
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.csv
+*.zip
+*.gz
+*.tar
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ============ 例外：外部来源的原始材料是证据，必须进 git ============
+!*/references/
+!*/references/**
