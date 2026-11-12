@@ -15,10 +15,6 @@
   {PATH_XDATA}/{file_name}__nokey 主键（除日期外）任一列为空的行，原样存放，不去重；索引 (date, NOKEY_SEQ)，没有就不建
 
 日志（2026-11-11 起）：logs/{数据集}_{命令}_{时间}.log（进度、用时、内存，人看）+ 同名 .jsonl（build/update 每组明细）。
-
-存储粒度（2026-11-12 更新）：
-  根据 xdata 维护者答复（见 common/README.md），改用 data_type='second'，按天分块、可并行写。
-  一次 write/append 传入多天的数据，xdata 会自动按天拆开存；多个进程同时 append 不同日期是安全的。
 """
 
 import argparse
@@ -61,13 +57,13 @@ N_JOBS = 40  # 2026-11-11 diagnose --n-jobs 10 实测每个 worker 1.5~6 GB（�
 MAX_BUFFER = 10  # build/update：正在算的组 + 已算完等着按日期顺序写库的组，合计最多 n_jobs + MAX_BUFFER 个
 
 
-def save_to_xdata(remote_path, data, desc=""):
+def save_to_xdata(remote_path, data, desc="", data_type="second"):
     # 只在主进程里写库（原脚本在并行 worker 里各自 append，多个 worker 可能同时看到"不存在"而重复 register，
-    # append 顺序也不按日期）。
-    # 2026-11-12：改用 second（按天分块），可并行写；维护者确认已存在的表不需要重新 register。
+    # append 顺序也不按日期）
+    # 2026-11-12：改用配置的 data_type（当前默认 second 按天分块），可并行写；维护者确认已存在的表不需要重新 register。
     cli = get_cli()
     if not cli.exists(remote_path):
-        cli.register(remote_path, "second", "xx", is_public=False, desc=desc)
+        cli.register(remote_path, data_type, "xx", is_public=False, desc=desc)
         cli.write(remote_path, data)
     else:
         cli.append(remote_path, data)
@@ -334,6 +330,10 @@ def _run(
     totals, warn_cnt = Counter(), Counter()
     n, t0, t_write = len(groups), time.time(), 0.0
     args = [(file_name, g, schema, start_date) for g in groups]
+    dt = DATASETS[file_name][
+        "data_type"
+    ]  # 2026-11-12: 读取该数据集配置的存储粒度（second/minute/daily）
+
     with open(jsonl_path, "w", encoding="utf-8") as jl:
         # 并行只做读取+转换+去重；写库在主进程里按日期顺序做（run_parallel ordered=True 保证顺序）
         for i, (d, dup, nokey, rep) in run_parallel(
@@ -370,11 +370,11 @@ def _run(
                 totals[k] += rep.get(k, 0)
             tw = time.time()
             if d is not None and not d.empty:
-                save_to_xdata(path, d)
+                save_to_xdata(path, d, data_type=dt)
             if dup is not None and not dup.empty:
-                save_to_xdata(path + "__dup", dup)
+                save_to_xdata(path + "__dup", dup, data_type=dt)
             if nokey is not None and not nokey.empty:
-                save_to_xdata(path + "__nokey", nokey)
+                save_to_xdata(path + "__nokey", nokey, data_type=dt)
             tw = time.time() - tw
             t_write += tw
             el = time.time() - t0

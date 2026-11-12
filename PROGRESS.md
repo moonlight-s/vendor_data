@@ -7,10 +7,9 @@
 
 - 数据源： Bloomberg
 - 数据集：equityNamrV2（Bloomberg 共 6 个数据集中的第 1 个）
-- 阶段： 第一阶段。类型推断、全量校验、规模摸底、重复诊断已完成；写库方式已根据 xdata 维护者的答复重新设计（改为 `second` 按天分块）。
-- 下一步（只做这一件）： 用修改后的 `bbg_clean.py` 重新跑一次试跑 `python bbg_clean.py build equityNamrV2 --trial 3`，观察写库耗时是否明显下降，并读回检查。
-- 下游怎么读： 维护者已确认列式存储可以按列读，`second` 按天分块。下游读法暂定用 `read_bbg` 按列读取。
-- 之后： 试跑通过且耗时满意后，正式全量 build（她先读代码确认）；接着做其余 5 个数据集。
+- 阶段： 第一阶段。类型推断、全量校验、规模摸底、重复诊断、试跑读回全部完成；写库方式已改为 `second` 按天分块；代码已审查完毕。
+- 下一步（只做这一件）： 全量执行 `build`，将 235 个文件正式写入 xdata。命令：`python bbg_clean.py build equityNamrV2 --n-jobs 40`。
+- 之后： 写回检查全量数据；接着做其余 5 个数据集（equityNamrCins、equityNamrPricing、3 个 CorporateActions）。
 
 ## 总体路线
 
@@ -20,7 +19,7 @@
 2 | Bloomberg equityNamrV2：类型推断 → 人工审阅 → 全量校验 | ✅ 完成
 3 | Bloomberg equityNamrV2：数据规模摸底（bbg_inspect） | ✅ 完成
 4 | Bloomberg equityNamrV2：重复诊断（diagnose）→ 主键完整的行无冲突；主键为空的 17 行单独存 __nokey（方案 A） | ✅ 完成
-5 | Bloomberg equityNamrV2：试跑（build --trial 3，✅ 读回通过；写库太慢）→ 按维护者答复改为 `second` 写库 → **重新试跑** → 全量入库（build），读回检查 | ⏭ 进行中
+5 | Bloomberg equityNamrV2：试跑（build --trial 3，✅ 读回通过；写库耗时从 184s 降到 23s）→ **全量入库（build）**，读回检查 | ⏭ 进行中
 6 | Bloomberg 其余 5 个数据集：equityNamrCins、equityNamrPricing、3 个 CorporateActions，各走一遍 2~5 | 待做
 7 | 用 GLM 从 Bloomberg 数据说明中摘取字段定义，解决 bbg/PROCESSING.md 中的未确认问题 | 待做
 8 | Refinitiv 第一阶段 | 待做
@@ -31,18 +30,12 @@
 
 ### 2026-11-12
 
-- 拿到 xdata 维护者对 7 个问题的答复（记录在 common/README.md）：
-  - append 要重写所在年块（放弃 daily）；
-  - 改用 `second`，按天分块；
-  - 多进程并行 append 不同日期安全；
-  - 已有表无需重新 register；
-  - 不允许代码删路径（需手动删）；
-  - register 第三参数是 desc 备注；
-  - 列式存储可时间分块 × 列读。
-- 修改 `bbg_clean.py` 的 `save_to_xdata`：`data_type` 改为 `'second'`，写入前 `exists` 判断，存在则 append，不存在则 register+write。
-- 更新 `bbg/PROCESSING.md` 第 7 节（空主键行确认存 `__nokey`）。
-- 更新 `common/README.md` 存储粒度与维护者答复。
-- 新增 `gen_git_path.py`（原 test.py 改名）与 `urls.txt`。
+- 拿到 xdata 维护者对 7 个问题的答复（记录在 common/README.md）。
+- 试跑（build --trial 3）改用 `second` 存储（按天分块），写库耗时大幅下降（第 2 组从 108s 降至 17s，第 3 组从 184s 降至 23s），彻底解决写库瓶颈。
+- 试跑数据读回检查通过：索引正确（`date` 和 `ID_BB_UNIQUE`），主键唯一且无空值；`__nokey` 表 2 行数据正确。
+- 为未来不同数据集（或不同数据商）使用不同存储粒度预留扩展性，将 `data_type` 抽离至 `DATASETS` 配置中，当前 6 个 BBG 数据集均默认 `second`。
+- 更新 `bbg/PROCESSING.md`：补充“核心前提假设：第一列必须是日期”；补充存储粒度可配置说明。
+- 完成全量 build 前的最终代码审查。
 
 ### 2026-11-11
 

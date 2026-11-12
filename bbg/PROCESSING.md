@@ -10,14 +10,14 @@
 原始数据路径：/mnt/win-g12x/Research/BBG/{数据集名}/*.parquet
 入库路径：stock_1d/xdata_test/vendor_data/bbg/{数据集名}（主键冲突行表 {数据集名}__dup，主键为空的行表 {数据集名}__nokey；试跑写到 {数据集名}_trial 及其 __dup / __nokey）
 
-数据集 | 主键（第一个列入库后改名为 date） | 主键冲突时的选行规则（暂定，待 diagnose 验证）
----|---|---
-equityNamrV2 | DL_SNAPSHOT_DATE, ID_BB_UNIQUE | n_nonnull → row_order
-equityNamrCins | DL_SNAPSHOT_DATE, ID_BB_UNIQUE | n_nonnull → row_order
-equityNamrPricing | DL_SNAPSHOT_DATE, ID_BB_UNIQUE, EXCH_CODE | has_px_last → n_nonnull → row_order
-equityNamrCorporateActionsV2 | DL_SNAPSHOT_DATE, ID_BB_UNIQUE, ACTION_ID, CP_AMENDMENT_DATE | comp_match → n_nonnull → row_order
-effDtEquityNamrCorporateActionsCorporateActions | 同上 | 同上
-premarketEquityNamrCorporateActionsV2CorporateActions | 同上 | 同上
+数据集 | 主键（第一个列入库后改名为 date） | 主键冲突时的选行规则（暂定，待 diagnose 验证） | 存储粒度(data_type)
+---|---|---|---
+equityNamrV2 | DL_SNAPSHOT_DATE, ID_BB_UNIQUE | n_nonnull → row_order | second
+equityNamrCins | DL_SNAPSHOT_DATE, ID_BB_UNIQUE | n_nonnull → row_order | second
+equityNamrPricing | DL_SNAPSHOT_DATE, ID_BB_UNIQUE, EXCH_CODE | has_px_last → n_nonnull → row_order | second
+equityNamrCorporateActionsV2 | DL_SNAPSHOT_DATE, ID_BB_UNIQUE, ACTION_ID, CP_AMENDMENT_DATE | comp_match → n_nonnull → row_order | second
+effDtEquityNamrCorporateActionsCorporateActions | 同上 | 同上 | second
+premarketEquityNamrCorporateActionsV2CorporateActions | 同上 | 同上 | second
 
 选行规则的含义：按顺序比较，值越大越优先。
 
@@ -27,6 +27,23 @@ premarketEquityNamrCorporateActionsV2CorporateActions | 同上 | 同上
 - row_order：在原文件中越靠后越优先。
 
 主键沿用原脚本的定义，尚未用数据验证。
+
+### ⚠️ 核心前提假设：第一列必须是日期
+
+目前第一阶段的所有代码（包括 bbg_clean.py、bbg_common.py 等），都基于一个极强的默认前提：**数据的业务主键中，第一个必须是日期（或时间戳）列。**
+
+在配置 DATASETS 的 key 时，必须遵循以下硬性规则：
+1. key 列表的第一个元素，必须是代表日期的列（对于 BBG 数据，就是 DL_SNAPSHOT_DATE）。
+2. 在落库时，代码会自动把这个第一列重命名为 date，并作为 xdata 的 MultiIndex 的第一层级（例如 ['date', 'ID_BB_UNIQUE']）。
+
+代码中大量依赖此假设的地方：
+- bbg_clean.py 的 split_nokey()：使用 key[1:] 来排除日期列，检查其他业务主键是否为空。
+- bbg_clean.py 的 to_xdata_frame()：使用 index_cols[1:] 来配合日期列生成多级索引。
+- bbg_schema.py 等推断脚本：默认按照日期进行文件分组（plan_groups）。
+- 下游 bbg_read.py：默认第一层索引是日期（date），方便按时间范围切片读取。
+
+未来扩展的注意事项：
+如果未来接入的新数据商（或新数据集）的数据结构不是“按日期切片”的（例如：按证券 ID 切分，或者没有日期列），不能直接复用当前的代码。必须重写 plan_groups（分组逻辑）和 to_xdata_frame（索引构建逻辑）。
 
 ## 2. 代码
 
@@ -77,6 +94,7 @@ bbg_read.py | 下游读取入口 read_bbg(name, table='', **cli.read参数)，�
   - 主键冲突的行全部原样存入 {name}__dup 表，并加 DUP_CHOSEN、DUP_SEQ 两列；
   - 主表按第 1 节的规则选一行，并加 DUP_N 列（该主键在原始数据中的行数，1 表示无冲突）。
 - 写入：并行只做读取和转换，由主进程按日期顺序写入（原脚本在并行进程里各自 append，可能重复 register，顺序也不对）。2026-11-11 起：哪组先算完先收下，轮到它时立即写库，worker 不必等整批算完（原来每批 --batch 组一起跑，并发最多只有 batch 个，而且要等整批最慢的一组）；"正在算的 + 已算完等着写的"合计不超过 n_jobs + max_buffer 组，以控制主进程内存。默认 --n-jobs 40、--max-buffer 10。
+- 存储粒度（2026-11-12 起）：根据 xdata 维护者答复，注册为 data_type='second'，按天分块，可多进程并行写。代码中已将此参数抽离至 DATASETS 字典的 data_type 字段，方便未来按表定制。
 - 安全措施：
   - build 时如果目标路径（含 __dup、__nokey）已存在，拒绝执行；
   - 正式 build 前先用 --trial N 把最早 N 组写到 {name}_trial 试跑真实 xdata（读回用 read_bbg(name, table='_trial')）；
@@ -148,3 +166,4 @@ DL_SNAPSHOT_START_TIME / END_TIME 最晚到 2025-08-31，而 DL_SNAPSHOT_DATE �
 2026-11-11 | 主键为空的行单独存 __nokey 表（方案 A）；diagnose 同样把这些行排除在冲突判断外；新增 build --trial N 试跑
 2026-11-11 | bbg_clean.py：加运行日志（进度、用时、内存峰值）；分组只解析去重日期；去掉 --batch，改为边算边按顺序写库（--max-buffer）；默认并发 10 → 40。用模拟数据 + 假 xdata 测过 infer / diagnose / build / 重复 build 拒绝 / update 拒绝 / 读回 / 出错中止，日期列为字符串和 date32 两种情况都测了
 2026-11-12 | 第 7 节：删去「ID_BB_UNIQUE 为空的 17 行待定」一行，改为已确认方案 A（见第 5 节）
+2026-11-12 | 试跑（--trial 3）改用 second 存储，耗时从 184s 降至 23s。补充“第一列必须是日期”的核心前提假设。将 data_type 抽离为数据集可配置项。
