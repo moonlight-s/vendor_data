@@ -58,9 +58,7 @@ MAX_BUFFER = 10  # build/update：正在算的组 + 已算完等着按日期顺�
 
 
 def save_to_xdata(remote_path, data, desc="", data_type="second"):
-    # 只在主进程里写库（原脚本在并行 worker 里各自 append，多个 worker 可能同时看到"不存在"而重复 register，
-    # append 顺序也不按日期）
-    # 2026-11-12：改用配置的 data_type（当前默认 second 按天分块），可并行写；维护者确认已存在的表不需要重新 register。
+    # 只在主进程里写库
     cli = get_cli()
     if not cli.exists(remote_path):
         cli.register(remote_path, data_type, "xx", is_public=False, desc=desc)
@@ -94,7 +92,7 @@ def _comp_match(d):
     return (a == b).astype(int)
 
 
-# 越大越优先；row_order 放最后作为兜底（= 原来的 keep='last'，文件里靠后的行优先）
+# 越大越优先；row_order 放最后作为兜底
 SCORERS = {
     "n_nonnull": _n_nonnull,
     "has_px_last": _has_px_last,
@@ -110,12 +108,6 @@ def _drop_exact_dups(d):
 
 
 def resolve_dups(d, key, priority):
-    """
-    1. 完全相同的行（忽略 META_COLS）只留一行 —— 无信息损失
-    2. 主键冲突：所有冲突行原样进 dup 表；主表按 priority 选一行，并标 DUP_N
-    不再删列（原脚本一旦有重复就把 COLUMN0 / ID_BB_SEC_NUM_DES 整列删掉，
-    导致"有重复的文件"和"没重复的文件"列不一样）。
-    """
     rep = {}
     d, rep["n_exact_dup"] = _drop_exact_dups(d)
     g = d.groupby(key, dropna=False, sort=False).ngroup()
@@ -143,7 +135,6 @@ def resolve_dups(d, key, priority):
 
 # ============================== 单组文件处理 ==============================
 def load_and_cast(file_name, files, schema, start_date=None, allow_new_cols=False):
-    """读一组文件 -> 字段检查 -> 强制类型转换 -> 取值范围检查。不改动任何行。"""
     specs, na_tokens = schema["columns"], schema["na_tokens"]
     raw = pd.concat([read_parquet(f) for f in files], ignore_index=True)
     rep = dict(
@@ -153,10 +144,9 @@ def load_and_cast(file_name, files, schema, start_date=None, allow_new_cols=Fals
     new_cols = [c for c in raw.columns if c not in specs]
     missing = [c for c in specs if c not in raw.columns]
     if new_cols and not allow_new_cols:
-        # 新字段：xdata 已有表能否追加新列我无法确认，所以一律拦下，人工决定
         rep["errors"]["new_cols"] = new_cols
     if missing:
-        rep["missing_cols"] = missing  # 补成空列，保证每次入库列一致
+        rep["missing_cols"] = missing
 
     out, cast_err = {}, {}
     for c, spec in specs.items():
@@ -173,7 +163,7 @@ def load_and_cast(file_name, files, schema, start_date=None, allow_new_cols=Fals
                 n=int(bad.sum()),
                 examples=[str(x) for x in s[bad].unique()[:EXAMPLES_MAX]],
             )
-        if oob.any():  # 超出 pandas 日期范围 -> NaT，原值记进日志
+        if oob.any():
             rep["warnings"].append(
                 dict(
                     col=c,
@@ -196,7 +186,7 @@ def load_and_cast(file_name, files, schema, start_date=None, allow_new_cols=Fals
     rep["n_rows"] = len(d)
 
     for c, spec in specs.items():
-        if c != DATE_COL:  # 快照日期增量时必然超出历史最大值，不提示
+        if c != DATE_COL:
             rep["warnings"] += check_values(d[c], spec, c)
     return d, rep
 
@@ -205,20 +195,18 @@ def to_xdata_frame(d, specs, index_cols):
     d = d.copy()
     for c in d.columns:
         spec = specs.get(c) or EXTRA_SPECS.get(c)
-        if spec:
-            d[c] = to_storage(d[c], spec, c)
+        if not spec:
+            raise KeyError(
+                f"[bbg_clean] 入库时发现既不在 schema 也不在 EXTRA_SPECS 中的列: {c}，拒绝写入。"
+            )
+        d[c] = to_storage(d[c], spec, c)
+
     d = d.set_index(index_cols).sort_index()
     d.index = d.index.set_names(["date"] + index_cols[1:])
     return d
 
 
 def split_nokey(d, key):
-    """
-    主键（除日期外）任一列为空的行单独拿出来，原样存进 __nokey 表（2026-11-11 她确认，方案 A）。
-    依据：equityNamrV2 全量有 17 行 ID_BB_UNIQUE 为空，只有 DL_DATASET / 日期 / START_TIME / END_TIME /
-    COLUMN0 / RC 有值，是不同证券的请求记录；若参与去重会被误当成主键冲突。日期为空的行在 load_and_cast 里已报错。
-    索引 (date, NOKEY_SEQ)：NOKEY_SEQ = 同一天内的序号（按原始行顺序）。
-    """
     m = d[key[1:]].isna().any(axis=1)
     if not m.any():
         return d, None
@@ -247,10 +235,6 @@ def process_group(file_name, files, schema, start_date=None):
 
 # ============================== 文件分组 ==============================
 def _date_range(f, spec, na_tokens):
-    """
-    一个文件的 DL_SNAPSHOT_DATE 范围。只解析去重后的取值（每个文件只有几十个不同日期）。
-    2026-11-11：原来逐行解析，diagnose --n-jobs 10 实测这一步用了约 7.5 分钟（235 个文件、2 亿多行）。
-    """
     col = pq.ParquetFile(f).read(columns=[DATE_COL]).column(0)
     u = pc.unique(col)
     s = pa.table({DATE_COL: u}).to_pandas(types_mapper=_types_mapper)[DATE_COL]
@@ -259,10 +243,6 @@ def _date_range(f, spec, na_tokens):
 
 
 def plan_groups(file_name, files, schema, n_jobs, log):
-    """
-    先只读 DL_SNAPSHOT_DATE，得到每个文件的日期范围，按日期排序；
-    日期范围有重叠的文件合成一组一起处理（否则跨文件的重复永远查不到 —— 原脚本是逐文件去重的）。
-    """
     t0 = time.time()
     spec, na_tokens = schema["columns"][DATE_COL], schema["na_tokens"]
     log.info(f"[分组] 读取 {len(files)} 个文件的 {DATE_COL} ...")
@@ -270,7 +250,7 @@ def plan_groups(file_name, files, schema, n_jobs, log):
         delayed(_date_range)(f, spec, na_tokens) for f in files
     )
     bad = [(Path(f).name, nb) for f, _, _, nb in rngs if nb]
-    if bad:  # 入库时同样的值会在类型转换里报错、不入库；这里先提示
+    if bad:
         log.warning(
             f"[分组] 这些文件的 {DATE_COL} 有无法解析的取值（不同取值个数）：{bad[:EXAMPLES_MAX]}"
         )
@@ -330,12 +310,9 @@ def _run(
     totals, warn_cnt = Counter(), Counter()
     n, t0, t_write = len(groups), time.time(), 0.0
     args = [(file_name, g, schema, start_date) for g in groups]
-    dt = DATASETS[file_name][
-        "data_type"
-    ]  # 2026-11-12: 读取该数据集配置的存储粒度（second/minute/daily）
+    dt = DATASETS[file_name]["data_type"]  # 读取该数据集配置的存储粒度
 
     with open(jsonl_path, "w", encoding="utf-8") as jl:
-        # 并行只做读取+转换+去重；写库在主进程里按日期顺序做（run_parallel ordered=True 保证顺序）
         for i, (d, dup, nokey, rep) in run_parallel(
             process_group,
             args,
@@ -393,7 +370,6 @@ def _run(
 
 
 def build(file_name, n_jobs=N_JOBS, max_buffer=MAX_BUFFER, trial=None):
-    """trial=N：只处理最早的 N 组，写到 {file_name}_trial（试跑真实 xdata 用，正式表不受影响）。"""
     t0 = time.time()
     log, ts = setup_logger(file_name, "build_trial" if trial else "build")
     log.info(
@@ -428,12 +404,6 @@ def build(file_name, n_jobs=N_JOBS, max_buffer=MAX_BUFFER, trial=None):
 
 
 def update(file_name, start_date, n_jobs=N_JOBS, max_buffer=MAX_BUFFER):
-    """
-    增量。start_date 应为库里最后一天之后的日期；这里会先查库里 >= start_date 是否已有数据，有就拒绝，
-    因为 xdata 的 append 遇到重复日期怎么处理我无法确认。
-    新数据会：按历史 schema 转换（转不过去 -> 报错不入库）；出现新字段 -> 报错不入库；
-    取值超出历史范围/出现新类别 -> 打印提示，照常入库。
-    """
     t0 = time.time()
     log, ts = setup_logger(file_name, "update")
     log.info(
@@ -480,7 +450,7 @@ def _diagnose_group(file_name, files, schema):
     d, rep = load_and_cast(file_name, files, schema, allow_new_cols=True)
     if "cast" in rep["errors"]:
         return None
-    d, nokey = split_nokey(d, key)  # 与入库一致：主键为空的行不参与去重
+    d, nokey = split_nokey(d, key)
     n_nokey = 0 if nokey is None else len(nokey)
     d, n_exact = _drop_exact_dups(d)
     conf = d.duplicated(subset=key, keep=False)
@@ -497,9 +467,7 @@ def _diagnose_group(file_name, files, schema):
         return res
     sub = d[conf]
     g = sub.groupby(key, dropna=False, sort=False).ngroup()
-    differ = (
-        sub.drop(columns=key).groupby(g).nunique(dropna=False) > 1
-    )  # 每个冲突主键 × 每列：取值是否不同
+    differ = sub.drop(columns=key).groupby(g).nunique(dropna=False) > 1
     res["n_conf_keys"] = len(differ)
     res["diff_cols"] = Counter(differ.sum().loc[lambda x: x > 0].to_dict())
     res["patterns"] = Counter(differ.apply(lambda r: "|".join(r.index[r]), axis=1))
@@ -518,10 +486,6 @@ def _diag_desc(r):
 
 
 def diagnose(file_name, n_jobs=N_JOBS, limit_groups=None):
-    """
-    不写库。统计：完全重复行有多少；主键冲突的行，是哪些列不一样、最常见的"差异列组合"是什么。
-    看完再决定 DATASETS 里的 dup_priority（或者某些列要不要并入主键）。
-    """
     t0 = time.time()
     log, _ = setup_logger(file_name, "diagnose")
     log.info(f"diagnose {file_name}：n_jobs={n_jobs}, limit_groups={limit_groups}")

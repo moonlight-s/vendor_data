@@ -89,8 +89,7 @@ def _filter_by_start(files, schema, start_date):
 
 
 def scan_columns(files, n_jobs):
-    """读所有文件的 schema（只读 footer），得到列的并集（按首次出现顺序）和每个文件有哪些列。
-    原脚本只看 files[0] 的 schema，中途新增的列会被漏掉。"""
+    """读所有文件的 schema（只读 footer），得到列的并集（按首次出现顺序）和每个文件有哪些列。"""
     schemas = Parallel(n_jobs=n_jobs, prefer="threads")(
         delayed(pq.read_schema)(f) for f in files
     )
@@ -190,7 +189,6 @@ def _unique_strings(arr, kind, st, na_set):
         u = pc.drop_null(pc.unique(arr))
         return pd.Series([str(x) for x in u.to_pylist()], dtype=object)
     if kind == "temporal":
-        # 统一用 isoformat（带时分秒和时区），避免某个文件恰好全是零点被看成"日期"
         u = pd.Series(pc.drop_null(pc.unique(arr)).to_pandas())
         return pd.Series([x.isoformat() for x in u], dtype=object)
     raise ValueError(kind)
@@ -227,7 +225,6 @@ def _update_candidates(s, st):
     L = s.str.len()
     st["len_rng"] = _upd_rng(st["len_rng"], int(L.min()), int(L.max()))
 
-    # 每列有多少不同取值能/不能解析成数字（判断"几乎都是数字、只被少数占位符挡住"的列）
     if st["nonnum"] is not None:
         isnum = pd.to_numeric(s, errors="coerce").notna()
         st["n_num_uniq"] += int(isnum.sum())
@@ -398,7 +395,6 @@ def _infer_task(batch, plan, na_tokens):
 
 
 def _date_blockers(el):
-    """几种日期格式里，挑"挡住它的值里有长得像该格式的"那一种显示（否则显示的只是"本来就不是这个格式"）"""
     for fmt, rx in DATE_FMTS.items():
         ex = el.get(f"date|{fmt}") or []
         if any(re.fullmatch(rx, str(x)) for x in ex):
@@ -519,7 +515,6 @@ def verify(
     specs, na_tokens = schema["columns"], schema["na_tokens"]
     files = list_files(file_name)
 
-    # 增量校验支持
     if start_date:
         files = _filter_by_start(files, schema, start_date)
         if not files:
