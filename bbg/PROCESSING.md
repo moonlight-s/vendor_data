@@ -3,7 +3,7 @@
 本文件：Bloomberg 数据的处理规则、流程、代码、实证结论、未确认问题。
 第一阶段保留所有证券类型（数据中除股票外还有权证等），不做任何筛选。
 通用要求见根目录 README.md；当前进度见 PROGRESS.md；xdata 存储约定见 common/README.md。
-最后更新：2026-11-12
+最后更新：2026-11-13
 
 ## 1. 数据集
 
@@ -79,6 +79,40 @@ bbg_read.py | 下游读取入口 read_bbg(name, table='', **cli.read参数)，�
 ### 3.2 全量校验（bbg_schema.py verify）
 
 用 schema（推断结果 + 人工修正）在全部历史文件上逐列跑真正的转换函数，统计转不过去的值。
+
+### 3.2.1 增量校验与 Schema 的历史底线（2026-11-13）
+
+随着后续增量数据（`update`）的引入，必须明确 **Schema（`schema/inferred/*.json`）是历史全量数据（如 2006~2026）的客观记录，是“历史底线”**。
+
+1. **增量的校验方式**：
+   日常跑增量前，使用 `python bbg_schema.py verify equityNamrV2 --start YYYY-MM-DD` 仅校验新文件。若新数据出现新的极值（如价格突破历史最高价），`check_values` 会在日志中打出 `above_hist_max` 或 `unseen_value` 等 Warning。这属于**正常业务变化**，仅做提醒，绝不阻断 `clean.py update` 的入库。
+
+2. **绝不轻易覆盖底线**：
+   **严禁**为了消除上述 Warning，直接把增量数据的新极值覆盖写回 `schema/inferred/*.json`。如果新数据的最小值变大、最大值变小，强行覆盖会导致历史极值（如 2006 年的极低价）丢失，未来一旦回溯历史数据，将引发大规模的误报或精度灾难。
+
+3. **底线的更新时机**：
+   只有当积累了大量新数据（如跨越数年后），或者 Bloomberg 更改了底层字段定义时，才通过重新执行全量 `python bbg_schema.py infer equityNamrV2`（基于所有新旧文件）来重新计算一版新的 Schema。此时生成的 JSON 才是包含最新时间跨度的真正新底线。
+
+### 3.2.2 推断与校验结果的检查规则（2026-11-13）
+
+正式入库前，必须按以下规则检查 `infer` 和 `verify` 的输出，确认无误后方可执行 `build`。
+
+**（1）检查 `infer` 结果（类型推断）**
+- **位置**：终端日志、`reports/{name}_infer.csv`
+- **规则**：
+  - 确认终端打印的“需要人工确认的列”，尤其注意 `decided_by: name_rule`（因字段名含 DT/DATE 被强制判为日期）的列是否符合业务常识。
+  - 检查 `type` 分布，确保核心数值列（如价格、数量）未被错误降级为 `string`。若被降级，在 `_infer.csv` 中查看 `why_not_float` 或 `nonnum_values`，通常是因为混入了极少数占位符（如 `N.A.`）。
+  - 检查 `note` 列，确认 `oob_examples`（超范围年份）符合 R3 规则的预期；确认 `nested` 结构体按 `json` 或 `string` 处理。
+
+**（2）检查 `verify` 结果（全量校验）**
+- **位置**：终端日志、`reports/{name}_verify.csv`
+- **规则**：
+  - **一票否决项**：终端提示“校验未通过 X 列”或报告中出现 `NOT_IN_SCHEMA`（新列）。若 `n_bad > 0`，说明存在按 schema 转不过去的值，必须排查原始数据或调整 schema，**严禁继续执行 `build`**。
+  - **警告放行项**：报告 `warnings` 列中的 `above_hist_max`、`unseen_value` 等，属于增量数据自然突破历史范围或产生新枚举值，仅作为提醒，**允许通过**。
+  - **放行标准**：终端必须明确打印“全部 N 列在 M 个文件上均可按 schema 转换”，方可进入 `build`。
+
+**（3）增量更新时的检查**
+- 使用 `verify --start YYYY-MM-DD` 仅校验增量文件。此时只需确保没有 `n_bad` 致命错误，警告类信息可以忽略。检查通过后，执行 `clean.py update` 进行增量入库。
 
 ### 3.3 入库（bbg_clean.py build / update）
 
@@ -167,3 +201,4 @@ DL_SNAPSHOT_START_TIME / END_TIME 最晚到 2025-08-31，而 DL_SNAPSHOT_DATE �
 2026-11-11 | bbg_clean.py：加运行日志（进度、用时、内存峰值）；分组只解析去重日期；去掉 --batch，改为边算边按顺序写库（--max-buffer）；默认并发 10 → 40。用模拟数据 + 假 xdata 测过 infer / diagnose / build / 重复 build 拒绝 / update 拒绝 / 读回 / 出错中止，日期列为字符串和 date32 两种情况都测了
 2026-11-12 | 第 7 节：删去「ID_BB_UNIQUE 为空的 17 行待定」一行，改为已确认方案 A（见第 5 节）
 2026-11-12 | 试跑（--trial 3）改用 second 存储，耗时从 184s 降至 23s。补充“第一列必须是日期”的核心前提假设。将 data_type 抽离为数据集可配置项。
+2026-11-13 | bbg_schema.py 增加 verify 的 --start 增量校验；新增 3.2.1 历史底线规则、3.2.2 检查规则说明。
